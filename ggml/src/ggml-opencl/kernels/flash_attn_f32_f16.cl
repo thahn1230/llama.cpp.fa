@@ -1,4 +1,5 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
 
 #define ACC_TYPE float
 #define ACC_TYPE4 float4
@@ -10,10 +11,17 @@
 #define CONVERT_KV_ACC4(x) convert_float4(x)
 #define CONVERT_O_DATA4(x) (x)
 
+// 매크로가 정의되어 있지 않을 경우를 대비한 안전장치 (보통 컴파일 옵션으로 넘어옴)
+#ifndef DK
+#define DK 128
+#endif
+
 #define DK_VEC (DK/4)
 #define DV_VEC (DV/4)
 #define WG_SIZE (BLOCK_M)
-#define Q1_WG_SIZE 64
+
+// Decoding Kernel을 위한 전용 Wave Size (Adreno 최적화: 64)
+#define DEC_WG_SIZE 64
 
 inline float get_alibi_slope(
     const float max_bias, const uint h, const uint n_head_log2, const float m0, const float m1
@@ -26,6 +34,10 @@ inline float get_alibi_slope(
 
     return pow(base, exph);
 }
+
+// =================================================================================================
+// 1. Prefill Kernel (원본 유지)
+// =================================================================================================
 __kernel void flash_attn_f32_f16(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -207,6 +219,9 @@ __kernel void flash_attn_f32_f16(
     }
 }
 
+// =================================================================================================
+// 2. Optimized Decoding Kernel (Dimension Parallelism for Adreno)
+// =================================================================================================
 __kernel void flash_attn_f32_f16_q1(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
@@ -237,20 +252,41 @@ __kernel void flash_attn_f32_f16_q1(
     const global void* sinks_void,
     const ulong sinks_offset
 ) {
-    const int tid = get_local_id(0);
-    const int head_batch_idx = get_global_id(1);
+    // Q를 Shared Memory에 캐싱 (Half precision으로 변환하여 저장)
+    // DK는 128 같은 매크로 상수로 정의되어야 함.
+    __local half l_q[DK];
 
+    const int tid = get_local_id(0); // 0 ~ 63
+    const int head_batch_idx = get_global_id(1);
     const int batch_idx = head_batch_idx / n_head;
     const int head_idx = head_batch_idx % n_head;
-
     const int gqa_ratio = n_head / n_head_kv;
     const int head_kv_idx = head_idx / gqa_ratio;
 
+    // [1] Load Q: 64개 스레드가 협력하여 DK(128) 크기의 Q를 로드
     const global char* q_base = (const global char*)q_void + q_offset;
+    const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
+    const global float* q_ptr = (const global float*)(q_base + q_row_offset);
+
+    // DEC_WG_SIZE(64) 스트라이드로 로드
+    for (int i = tid; i < DK; i += DEC_WG_SIZE) {
+        l_q[i] = (half)q_ptr[i]; 
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // [2] Accumulator 초기화
+    // 레지스터 스필 방지를 위해 각 스레드는 오직 2개의 Output(float2)만 관리
+    // DK=128, WG=64 -> 1 thread covers 2 elements (index: tid*2, tid*2+1)
+    float2 my_o_acc = (float2)(0.0f, 0.0f);
+    
+    float m_local = -INFINITY;
+    float l_local = 0.0f;
+
+    const int my_dim_base = tid * 2; // 내 스레드가 담당할 차원 시작점
+
     const global char* k_base = (const global char*)k_void + k_offset;
     const global char* v_base = (const global char*)v_void + v_offset;
-    global char* o_base = (global char*)o_void + o_offset;
-
+    
     const global char* mask_base = NULL;
     if (mask_void != NULL) {
         const int mask_head_idx = head_idx % mask_ne2;
@@ -258,116 +294,95 @@ __kernel void flash_attn_f32_f16_q1(
         mask_base = (const global char*)mask_void + mask_offset + mask_batch_idx * mask_nb3 + mask_head_idx * mask_nb2;
     }
 
-    ACC_TYPE4 q_priv[DK_VEC];
-    const ulong q_row_offset = batch_idx * q_nb3 + head_idx * q_nb2;
-    const global Q_DATA_TYPE4* q_ptr = (const global Q_DATA_TYPE4*)(q_base + q_row_offset);
-    #pragma unroll
-    for (int i = 0; i < DK_VEC; ++i) {
-        q_priv[i] = CONVERT_Q_ACC4(q_ptr[i]);
-    }
-
     float slope = get_alibi_slope(max_bias, head_idx, n_head_log2, m0, m1);
-
-    const global ACC_TYPE* sinks_ptr = NULL;
+    
+    // Sink 초기화
     if (sinks_void != NULL) {
-        sinks_ptr = (const global ACC_TYPE*)((const global char*)sinks_void + sinks_offset);
+        const global float* sinks_ptr = (const global float*)((const global char*)sinks_void + sinks_offset);
+        m_local = sinks_ptr[head_idx];
     }
 
-    ACC_TYPE m_i = (sinks_ptr != NULL) ? sinks_ptr[head_idx] : -INFINITY;
-    for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
+    // [3] Main Loop (Iterate over KV tokens)
+    // 스레드당 연산량을 최소화하여 GPU 점유율 극대화
+    for (int k_idx = 0; k_idx < n_kv; ++k_idx) {
+        // A. Partial Dot Product (내 담당 차원만 계산)
         const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
-        const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
-        ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
-        #pragma unroll
-        for (int k = 0; k < DK_VEC; k++) {
-            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
+        
+        // vload_half2: 2개의 half를 읽어 float2로 변환 (효율적)
+        // k_ptr이 half*라고 가정 (KV_DATA_TYPE4가 half4이므로)
+        const global half* k_ptr_half = (const global half*)(k_base + k_row_offset);
+        
+        // 범위 체크 (DK가 128이 아닐 경우 대비)
+        float my_score_part = 0.0f;
+        if (my_dim_base < DK) {
+             // Local Memory Q 읽기 (half* -> half2 -> float2)
+             half2 q_h2 = *(__local half2*)&l_q[my_dim_base];
+             float2 q_val = convert_float2(q_h2);
+             
+             // Global Memory K 읽기
+             float2 k_val = vload_half2(0, k_ptr_half + my_dim_base);
+             
+             my_score_part = dot(q_val, k_val);
         }
-        ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
+
+        // B. Reduction (Subgroup Sum) -> 전체 차원(128)에 대한 Score 완성
+        // Adreno 하드웨어 레벨 리덕션 (매우 빠름)
+        float score = sub_group_reduce_add(my_score_part);
+        
+        // Score Scaling & Masking (모든 스레드가 동일한 값 보유)
+        score *= scale;
         if (mask_base != NULL) {
-            const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
-            score += slope * (ACC_TYPE)mask_ptr[k_idx];
+            const global half* mask_ptr = (const global half*)(mask_base);
+            score += slope * (float)mask_ptr[k_idx];
         }
         if (logit_softcap > 0.0f) {
             score = logit_softcap * tanh(score / logit_softcap);
         }
-        m_i = max(m_i, score);
-    }
 
-    __local ACC_TYPE local_m[Q1_WG_SIZE];
-    local_m[tid] = m_i;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
-    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const ACC_TYPE m_final = local_m[0];
+        // C. Online Softmax Update
+        float m_prev = m_local;
+        m_local = max(m_prev, score);
+        
+        float p = 0.0f;
+        float scale_prev = 1.0f;
+        if (m_local > -INFINITY) {
+            p = exp(score - m_local);
+            scale_prev = (m_prev > -INFINITY) ? exp(m_prev - m_local) : 0.0f;
+        }
 
-    ACC_TYPE4 o_acc[DV_VEC];
-    #pragma unroll
-    for (int i = 0; i < DV_VEC; ++i) o_acc[i] = (ACC_TYPE4)(0.0f);
-    ACC_TYPE l_i = 0.0f;
+        l_local = l_local * scale_prev + p;
 
-    for (int k_idx = tid; k_idx < n_kv; k_idx += Q1_WG_SIZE) {
-        const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_idx * k_nb1;
+        // D. Accumulate V (Dimension Parallel)
+        // 내 담당 차원(2개)에 해당하는 V값만 업데이트
         const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + k_idx * v_nb1;
-        const global KV_DATA_TYPE4* k_ptr = (const global KV_DATA_TYPE4*)(k_base + k_row_offset);
-        const global KV_DATA_TYPE4* v_ptr = (const global KV_DATA_TYPE4*)(v_base + v_row_offset);
-        ACC_TYPE4 dot_acc = (ACC_TYPE4)(0.0f);
-        #pragma unroll
-        for (int k = 0; k < DK_VEC; k++) {
-            dot_acc = mad(q_priv[k], CONVERT_KV_ACC4(k_ptr[k]), dot_acc);
-        }
-        ACC_TYPE score = (dot_acc.s0 + dot_acc.s1 + dot_acc.s2 + dot_acc.s3) * scale;
-        if (mask_base != NULL) {
-            const global MASK_DATA_TYPE* mask_ptr = (const global MASK_DATA_TYPE*)(mask_base);
-            score += slope * (ACC_TYPE)mask_ptr[k_idx];
-        }
-        if (logit_softcap > 0.0f) {
-            score = logit_softcap * tanh(score / logit_softcap);
-        }
-        const ACC_TYPE p = exp(score - m_final);
-        l_i += p;
-        #pragma unroll
-        for (int i = 0; i < DV_VEC; i++) {
-            o_acc[i] = mad(p, CONVERT_KV_ACC4(v_ptr[i]), o_acc[i]);
+        const global half* v_ptr_half = (const global half*)(v_base + v_row_offset);
+        
+        if (my_dim_base < DK) {
+            float2 v_val = vload_half2(0, v_ptr_half + my_dim_base);
+            // my_o = my_o * scale + p * v
+            my_o_acc = mad((float2)(p), v_val, my_o_acc * scale_prev);
         }
     }
 
-    __local ACC_TYPE local_l[Q1_WG_SIZE];
-    __local ACC_TYPE4 local_o_comp[Q1_WG_SIZE];
-    local_l[tid] = l_i;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
-    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) local_l[tid] += local_l[tid + s];
-        barrier(CLK_LOCAL_MEM_FENCE);
+    // [4] Final Normalize & Write
+    if (l_local > 0.0f) {
+        float l_inv = 1.0f / l_local;
+        my_o_acc *= l_inv;
+    } else {
+        my_o_acc = (float2)(0.0f);
     }
 
-    const ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
-    global O_DATA_TYPE4 *o_row = (global O_DATA_TYPE4 *)(o_base + o_row_offset);
-    ACC_TYPE l_final = local_l[0];
+    // Global Memory Write (각 스레드가 2개씩 씀)
+    global char* o_base = (global char*)o_void + o_offset;
+    ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
+    global float* o_ptr = (global float*)(o_base + o_row_offset);
 
-    if (sinks_ptr != NULL) {
-        l_final += exp(sinks_ptr[head_idx] - m_final);
-    }
-
-    if (l_final > 0.0f) {
-        const ACC_TYPE l_inv = 1.0f / l_final;
-        for (int i = 0; i < DV_VEC; i++) {
-            local_o_comp[tid] = o_acc[i];
-            barrier(CLK_LOCAL_MEM_FENCE);
-            #pragma unroll
-            for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
-                if (tid < s) local_o_comp[tid] += local_o_comp[tid + s];
-                barrier(CLK_LOCAL_MEM_FENCE);
-            }
-            if (tid == 0) {
-                o_row[i] = CONVERT_O_DATA4(local_o_comp[0] * l_inv);
-            }
+    if (my_dim_base < DK) {
+        // float2로 기록하는 것이 대역폭에 유리할 수 있으나,
+        // o_ptr이 float* 이므로 개별 기록 (컴파일러가 병합 최적화 수행함)
+        o_ptr[my_dim_base] = my_o_acc.x;
+        if (my_dim_base + 1 < DK) {
+            o_ptr[my_dim_base + 1] = my_o_acc.y;
         }
-    } else if (tid == 0) {
-        #pragma unroll
-        for (int i = 0; i < DV_VEC; ++i) o_row[i] = (O_DATA_TYPE4)(0.0f);
     }
 }
